@@ -161,21 +161,24 @@ def decode_sbd_bytes(
             return result
 
         tail_for_history = rem - 2
-        history_pairs = tail_for_history // 8
-        leftover = tail_for_history % 8
+        # Each GNSS history entry is now 12 bytes: lat(4) + lon(4) + timestamp(4)
+        history_entries = tail_for_history // 12
+        leftover = tail_for_history % 12
 
         gnss_history: List[Dict[str, Any]] = []
-        for _ in range(history_pairs):
-            if not require(8):
+        for _ in range(history_entries):
+            if not require(12):
                 result["errors"].append("Truncated inside GNSS history.")
                 break
             lat_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
             lon_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
+            timestamp_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
             lat_deg = _ddmm_to_decimal_from_enc(lat_enc, ddmm_scale)
             lon_deg = _ddmm_to_decimal_from_enc(lon_enc, ddmm_scale)
             gnss_history.append({
                 "lat_enc": lat_enc,
                 "lon_enc": lon_enc,
+                "timestamp_enc": timestamp_enc,
                 "lat_deg": lat_deg,
                 "lon_deg": lon_deg,
                 "lat_deg_fmt": _format_deg(lat_deg, width=lat_width, decimals=decimals),
@@ -192,7 +195,7 @@ def decode_sbd_bytes(
             start_leftover = len(data) - (2 + leftover)
             end_leftover = len(data) - 2
             result["unknown_tail"] = data[start_leftover:end_leftover]
-            result["errors"].append(f"Non-multiple-of-8 bytes in history section: {leftover} leftover bytes.")
+            result["errors"].append(f"Non-multiple-of-12 bytes in history section: {leftover} leftover bytes.")
         else:
             result["unknown_tail"] = b""
     else:
@@ -207,43 +210,44 @@ def pretty_print_decoded(decoded: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"Raw length: {decoded.get('raw_len')}")
     h = decoded.get("header", {})
-    lines.append(f"Header byte0=0x{h.get('byte0',0):02X} byte1=0x{h.get('byte1',0):02X}")
-    lines.append(f"  version={h.get('version')} msg_type={h.get('msg_type')}")
-    lines.append(f"  has_payload={h.get('has_payload')} needs_ack={h.get('needs_ack')} low_power={h.get('low_power')}")
+    lines.append(f"Header byte0=0x{{h.get('byte0',0):02X}} byte1=0x{{h.get('byte1',0):02X}}")
+    lines.append(f"  version={{h.get('version')}} msg_type={{h.get('msg_type')}}")
+    lines.append(f"  has_payload={{h.get('has_payload')}} needs_ack={{h.get('needs_ack')}} low_power={{h.get('low_power')}}")
 
     cur = decoded.get("current", {})
-    lines.append(f"Current coords: lat={cur.get('lat_deg_fmt')} lon={cur.get('lon_deg_fmt')} "
-                 f"(lat_enc={cur.get('lat_enc')} lon_enc={cur.get('lon_enc')})")
+    lines.append(f"Current coords: lat={{cur.get('lat_deg_fmt')}} lon={{cur.get('lon_deg_fmt')}} "
+                 f"(lat_enc={{cur.get('lat_enc')}} lon_enc={{cur.get('lon_enc')}})")
 
     bat = decoded.get("battery", {})
-    lines.append(f"Battery code: {bat.get('code')}")
+    lines.append(f"Battery code: {{bat.get('code')}}")
 
     iri = decoded.get("iri_timer", {})
-    lines.append(f"Iridium timer: {iri.get('value')}")
+    lines.append(f"Iridium timer: {{iri.get('value')}}")
 
     if decoded.get("payload_present"):
         tlv = decoded.get("tlv", {})
-        lines.append(f"TLV: type={tlv.get('type')} len={tlv.get('length')}")
-        lines.append(f"  value(hex)={tlv.get('value_bytes_hex')}")
+        lines.append(f"TLV: type={{tlv.get('type')}} len={{tlv.get('length')}}")
+        lines.append(f"  value(hex)={{tlv.get('value_bytes_hex')}}")
 
         hist = decoded.get("gnss_history", [])
-        lines.append(f"GNSS history pairs: {len(hist)} (latest-first)")
+        lines.append(f"GNSS history entries: {{len(hist)}} (latest-first)")
         for i, p in enumerate(hist):
-            lines.append(f"  [{i}] lat={p.get('lat_deg_fmt')} lon={p.get('lon_deg_fmt')} "
-                         f"(lat_enc={p.get('lat_enc')} lon_enc={p.get('lon_enc')})")
+            lines.append(f"  [{i}] lat={{p.get('lat_deg_fmt')}} lon={{p.get('lon_deg_fmt')}} "
+                         f"timestamp={{p.get('timestamp_enc')}} "
+                         f"(lat_enc={{p.get('lat_enc')}} lon_enc={{p.get('lon_enc')}})")
 
         rp = decoded.get("recording_period", {})
-        lines.append(f"Recording period: hour={rp.get('hour')} minute={rp.get('minute')}")
+        lines.append(f"Recording period: hour={{rp.get('hour')}} minute={{rp.get('minute')}}")
 
     tail = decoded.get("unknown_tail", b"")
     if tail:
-        lines.append(f"Unknown tail bytes ({len(tail)}): {tail.hex()}")
+        lines.append(f"Unknown tail bytes ({len(tail)}): {{tail.hex()}}")
 
     errs = decoded.get("errors", [])
     if errs:
         lines.append("Errors/Notes:")
         for e in errs:
-            lines.append(f"  - {e}")
+            lines.append(f"  - {{e}}")
 
     return "\n".join(lines)
 
@@ -263,7 +267,7 @@ def main():
             uploaded = files.upload()
             for fname in uploaded.keys():
                 input_bytes = uploaded[fname]
-                print(f"Decoding: {fname}")
+                print(f"Decoding: {{fname}}")
                 decoded = decode_sbd_bytes(input_bytes, ddmm_scale=1e4, lat_width=2, lon_width=2, decimals=6)
                 print(pretty_print_decoded(decoded))
             return
