@@ -3,6 +3,12 @@
 Single-file Iridium SBD decoder for frames built by build_sbdwb_frame_v2.
 - Run in terminal: python sbd_decode_single.py --file payload.sbd
 - Or in Google Colab: just run this file; it will open a file picker and print results.
+
+This version converts coordinates from DDMM.mmmm format to decimal degrees using:
+decimal_degrees = degrees + (minutes / 60)
+
+Assumes the encoded int32 is DDMM.mmmm scaled by --ddmm-scale (default 1e4).
+Negative values (S/W) are preserved by applying the sign after conversion.
 """
 
 import argparse
@@ -14,11 +20,6 @@ def _bytes_to_bits_msb_first(b: bytes) -> List[int]:
         for i in range(7, -1, -1):
             bits.append((by >> i) & 1)
     return bits
-
-def _to_degrees(enc: int, scale: Optional[float]) -> Optional[float]:
-    if scale is None:
-        return None
-    return enc / scale
 
 def _format_deg(value: Optional[float], width: int = 2, decimals: int = 6) -> Optional[str]:
     """
@@ -37,13 +38,38 @@ def _format_deg(value: Optional[float], width: int = 2, decimals: int = 6) -> Op
     frac_str = f"{frac_part:.{decimals}f}".split('.')[1]
     return f"{sgn}{int_str}.{frac_str}"
 
+def _ddmm_to_decimal_from_enc(enc: int, ddmm_scale: float) -> float:
+    """
+    Convert a signed encoded DDMM.mmmm integer to decimal degrees.
+    - enc is int32 (big-endian in the payload), possibly negative for S/W.
+    - ddmm_scale (default 1e4) converts the integer to a float DDMM.mmmm.
+    - decimal_degrees = degrees + minutes/60, with sign applied.
+    """
+    if ddmm_scale <= 0:
+        raise ValueError("ddmm_scale must be positive.")
+    sign = -1.0 if enc < 0 else 1.0
+    ddmm = abs(enc) / ddmm_scale
+    degrees = int(ddmm // 100)
+    minutes = ddmm - degrees * 100
+    decimal = degrees + minutes / 60.0
+    return sign * decimal
+
 def decode_sbd_bytes(
     data: bytes,
-    scale: Optional[float] = 1e7,
+    ddmm_scale: float = 1e4,
     lat_width: int = 2,
     lon_width: int = 2,
     decimals: int = 6
 ) -> Dict[str, Any]:
+    """
+    Decode an SBD payload produced by build_sbdwb_frame_v2, converting lat/lon from DDMM.mmmm to decimal degrees.
+
+    Parameters:
+      data: raw bytes of the SBD message payload
+      ddmm_scale: scale factor to get DDMM.mmmm from int32 (default 1e4, i.e., 4 decimals in minutes)
+      lat_width/lon_width: digits before '.' (zero-padded); default 2
+      decimals: digits after '.'; default 6
+    """
     result: Dict[str, Any] = {
         "raw_len": len(data),
         "header": {},
@@ -89,15 +115,15 @@ def decode_sbd_bytes(
     }
     result["payload_present"] = has_payload
 
-    # Current coordinates
+    # Current coordinates: lat[0], lon[0] big-endian signed int32 -> DDMM.mmmm -> decimal degrees
     if not require(8): return result
-    lat0 = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-    lon0 = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-    lat0_deg = _to_degrees(lat0, scale)
-    lon0_deg = _to_degrees(lon0, scale)
+    lat0_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
+    lon0_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
+    lat0_deg = _ddmm_to_decimal_from_enc(lat0_enc, ddmm_scale)
+    lon0_deg = _ddmm_to_decimal_from_enc(lon0_enc, ddmm_scale)
     result["current"] = {
-        "lat_enc": lat0,
-        "lon_enc": lon0,
+        "lat_enc": lat0_enc,
+        "lon_enc": lon0_enc,
         "lat_deg": lat0_deg,
         "lon_deg": lon0_deg,
         "lat_deg_fmt": _format_deg(lat0_deg, width=lat_width, decimals=decimals),
@@ -145,8 +171,8 @@ def decode_sbd_bytes(
                 break
             lat_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
             lon_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-            lat_deg = _to_degrees(lat_enc, scale)
-            lon_deg = _to_degrees(lon_enc, scale)
+            lat_deg = _ddmm_to_decimal_from_enc(lat_enc, ddmm_scale)
+            lon_deg = _ddmm_to_decimal_from_enc(lon_enc, ddmm_scale)
             gnss_history.append({
                 "lat_enc": lat_enc,
                 "lon_enc": lon_enc,
@@ -221,47 +247,42 @@ def pretty_print_decoded(decoded: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-def _decode_file(path: str, scale: Optional[float] = 1e7) -> Dict[str, Any]:
+def _decode_file(path: str, ddmm_scale: float = 1e4) -> Dict[str, Any]:
     with open(path, "rb") as f:
         data = f.read()
-    return decode_sbd_bytes(data, scale=scale, lat_width=2, lon_width=2, decimals=6)
+    return decode_sbd_bytes(data, ddmm_scale=ddmm_scale, lat_width=2, lon_width=2, decimals=6)
 
 def main():
     # Try Colab file picker if available and no CLI args
     import sys
-    use_colab = False
-    input_bytes: Optional[bytes] = None
     try:
         if len(sys.argv) == 1:
             import google.colab  # type: ignore
             from google.colab import files  # type: ignore
-            use_colab = True
             print("Select your SBD payload file...")
             uploaded = files.upload()
             for fname in uploaded.keys():
                 input_bytes = uploaded[fname]
                 print(f"Decoding: {fname}")
-                decoded = decode_sbd_bytes(input_bytes, scale=1e7, lat_width=2, lon_width=2, decimals=6)
+                decoded = decode_sbd_bytes(input_bytes, ddmm_scale=1e4, lat_width=2, lon_width=2, decimals=6)
                 print(pretty_print_decoded(decoded))
             return
     except Exception:
-        use_colab = False
+        pass
 
     # Simple CLI for terminal use
-    p = argparse.ArgumentParser(description="Decode Iridium SBD payloads (single-file script).")
+    p = argparse.ArgumentParser(description="Decode Iridium SBD payloads (DDMM.mmmm -> decimal degrees).")
     p.add_argument("--file", "-f", help="Path to a binary SBD payload file.")
     p.add_argument("--hex", "-x", help="Hex string representing the payload bytes.")
-    p.add_argument("--scale", type=float, default=1e7, help="Lat/Lon scale factor (default: 1e7). Set 0 to disable degree conversion.")
+    p.add_argument("--ddmm-scale", type=float, default=1e4, help="Scale of encoded DDMM.mmmm (default 1e4).")
     args = p.parse_args()
 
-    scale = None if args.scale == 0 else args.scale
-
     if args.file:
-        decoded = _decode_file(args.file, scale=scale)
+        decoded = _decode_file(args.file, ddmm_scale=args.ddmm_scale)
         print(pretty_print_decoded(decoded))
     elif args.hex:
         payload = bytes.fromhex(args.hex.strip())
-        decoded = decode_sbd_bytes(payload, scale=scale, lat_width=2, lon_width=2, decimals=6)
+        decoded = decode_sbd_bytes(payload, ddmm_scale=args.ddmm_scale, lat_width=2, lon_width=2, decimals=6)
         print(pretty_print_decoded(decoded))
     else:
         p.print_help()
