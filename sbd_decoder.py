@@ -210,44 +210,44 @@ def pretty_print_decoded(decoded: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"Raw length: {decoded.get('raw_len')}")
     h = decoded.get("header", {})
-    lines.append(f"Header byte0=0x{{h.get('byte0',0):02X}} byte1=0x{{h.get('byte1',0):02X}}")
-    lines.append(f"  version={{h.get('version')}} msg_type={{h.get('msg_type')}}")
-    lines.append(f"  has_payload={{h.get('has_payload')}} needs_ack={{h.get('needs_ack')}} low_power={{h.get('low_power')}}")
+    lines.append(f"Header byte0=0x{h.get('byte0',0):02X} byte1=0x{h.get('byte1',0):02X}")
+    lines.append(f"  version={h.get('version')} msg_type={h.get('msg_type')}")
+    lines.append(f"  has_payload={h.get('has_payload')} needs_ack={h.get('needs_ack')} low_power={h.get('low_power')}")
 
     cur = decoded.get("current", {})
-    lines.append(f"Current coords: lat={{cur.get('lat_deg_fmt')}} lon={{cur.get('lon_deg_fmt')}} "
-                 f"(lat_enc={{cur.get('lat_enc')}} lon_enc={{cur.get('lon_enc')}})")
+    lines.append(f"Current coords: lat={cur.get('lat_deg_fmt')} lon={cur.get('lon_deg_fmt')} "
+                 f"(lat_enc={cur.get('lat_enc')} lon_enc={cur.get('lon_enc')})")
 
     bat = decoded.get("battery", {})
-    lines.append(f"Battery code: {{bat.get('code')}}")
+    lines.append(f"Battery code: {bat.get('code')}")
 
     iri = decoded.get("iri_timer", {})
-    lines.append(f"Iridium timer: {{iri.get('value')}}")
+    lines.append(f"Iridium timer: {iri.get('value')}")
 
     if decoded.get("payload_present"):
         tlv = decoded.get("tlv", {})
-        lines.append(f"TLV: type={{tlv.get('type')}} len={{tlv.get('length')}}")
-        lines.append(f"  value(hex)={{tlv.get('value_bytes_hex')}}")
+        lines.append(f"TLV: type={tlv.get('type')} len={tlv.get('length')}")
+        lines.append(f"  value(hex)={tlv.get('value_bytes_hex')}")
 
         hist = decoded.get("gnss_history", [])
-        lines.append(f"GNSS history entries: {{len(hist)}} (latest-first)")
+        lines.append(f"GNSS history entries: {len(hist)} (latest-first)")
         for i, p in enumerate(hist):
-            lines.append(f"  [{i}] lat={{p.get('lat_deg_fmt')}} lon={{p.get('lon_deg_fmt')}} "
-                         f"timestamp={{p.get('timestamp_enc')}} "
-                         f"(lat_enc={{p.get('lat_enc')}} lon_enc={{p.get('lon_enc')}})")
+            lines.append(f"  [{i}] lat={p.get('lat_deg_fmt')} lon={p.get('lon_deg_fmt')} "
+                         f"timestamp={p.get('timestamp_enc')} "
+                         f"(lat_enc={p.get('lat_enc')} lon_enc={p.get('lon_enc')})")
 
         rp = decoded.get("recording_period", {})
-        lines.append(f"Recording period: hour={{rp.get('hour')}} minute={{rp.get('minute')}}")
+        lines.append(f"Recording period: hour={rp.get('hour')} minute={rp.get('minute')}")
 
     tail = decoded.get("unknown_tail", b"")
     if tail:
-        lines.append(f"Unknown tail bytes ({len(tail)}): {{tail.hex()}}")
+        lines.append(f"Unknown tail bytes ({len(tail)}): {tail.hex()}")
 
     errs = decoded.get("errors", [])
     if errs:
         lines.append("Errors/Notes:")
         for e in errs:
-            lines.append(f"  - {{e}}")
+            lines.append(f"  - {e}")
 
     return "\n".join(lines)
 
