@@ -1,295 +1,385 @@
 #!/usr/bin/env python3
 """
-Single-file Iridium SBD decoder for frames built by build_sbdwb_frame_v2.
-- Run in terminal: python sbd_decode_single.py --file payload.sbd
-- Or in Google Colab: just run this file; it will open a file picker and print results.
+SBD Frame Decoder for build_sbdwb_frame_v2()
 
-This version converts coordinates from DDMM.mmmm format to decimal degrees using:
-decimal_degrees = degrees + (minutes / 60)
-
-Assumes the encoded int32 is DDMM.mmmm scaled by --ddmm-scale (default 1e4).
-Negative values (S/W) are preserved by applying the sign after conversion.
+Usage:
+    python sbdwb_v2_decoder.py --file example.sbd
+    python sbdwb_v2_decoder.py -f msg.sbd --raw-hex
+    python sbdwb_v2_decoder.py -f msg.sbd --json
 """
 
 import argparse
-from typing import Any, Dict, List, Optional
+import struct
+import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 
-def _bytes_to_bits_msb_first(b: bytes) -> List[int]:
-    bits = []
-    for by in b:
-        for i in range(7, -1, -1):
-            bits.append((by >> i) & 1)
-    return bits
+# ── TLV Type IDs (must match firmware) ────────────────────────────────────────
+TLV_TYPE_BEACON_BIT_ARRAY = 0x01
+TLV_TYPE_HISTORICAL_GNSS  = 0x02
 
-def _format_deg(value: Optional[float], width: int = 2, decimals: int = 6) -> Optional[str]:
-    """
-    Format degrees with at least `width` digits before '.', zero-padded when fewer.
-    Keeps minus sign. If integer part has more than `width` digits, show all.
-    Examples: 7.5 -> '07.500000', -3.25 -> '-03.250000', 51.231451 -> '51.231451', 123.4 -> '123.400000'
-    """
-    if value is None:
-        return None
-    sgn = '-' if value < 0 else ''
-    abs_val = abs(value)
-    rounded = round(abs_val, decimals)
-    int_part = int(rounded)
-    frac_part = rounded - int_part
-    int_str = f"{int_part:0{width}d}" if int_part < 10**width else str(int_part)
-    frac_str = f"{frac_part:.{decimals}f}".split('.')[1]
-    return f"{sgn}{int_str}.{frac_str}"
+# ── Data classes ──────────────────────────────────────────────────────────────
+@dataclass
+class GNSSReading:
+    latitude:        float
+    longitude:       float
+    lat_dm:          str
+    lon_dm:          str
+    timestamp:       int   = None
+    timestamp_utc:   str   = ""
+    timestamp_local: str   = ""
 
-def _ddmm_to_decimal_from_enc(enc: int, ddmm_scale: float) -> float:
+
+# ── Coordinate helpers ────────────────────────────────────────────────────────
+def encoded_to_decimal(raw_u32):
     """
-    Convert a signed encoded DDMM.mmmm integer to decimal degrees.
-    - enc is int32 (big-endian in the payload), possibly negative for S/W.
-    - ddmm_scale (default 1e4) converts the integer to a float DDMM.mmmm.
-    - decimal_degrees = degrees + minutes/60, with sign applied.
+    Convert the raw uint32 stored by the encoder into signed decimal degrees.
+
+    The encoder does:
+        int32_t lat_enc = gnss_lat[i];   // gnss_lat[] is volatile uint32_t*
+        frame1[idx++] = (lat_enc >> 24) & 0xFF;
+        ...
+
+    So the four bytes are just the big-endian reinterpretation of whatever
+    integer lives in gnss_lat[].  We re-interpret the unsigned 32-bit word
+    as a signed 32-bit integer (two's complement) to recover the original
+    signed value, then divide by 1e7 to get decimal degrees.
+
+    If your firmware stores coordinates as E7 (degrees * 1e7) this is correct.
+    If it stores NMEA DDMM*1e5 change the divisor to 1e5 and enable the
+    DDMM→decimal block below.
     """
-    if ddmm_scale <= 0:
-        raise ValueError("ddmm_scale must be positive.")
-    sign = -1.0 if enc < 0 else 1.0
-    ddmm = abs(enc) / ddmm_scale
+    # re-interpret as signed 32-bit
+    if raw_u32 & 0x80000000:
+        signed = raw_u32 - 0x100000000
+    else:
+        signed = raw_u32
+
+    # ── Option A  (most common): plain decimal degrees × 1e7 ─────────────────
+    #decimal = signed / 1e6
+    #return decimal
+
+    # ── Option B  (NMEA DDMM × 1e5): uncomment if your GPS gives NMEA format ─
+    ddmm    = signed / 1e4
     degrees = int(ddmm // 100)
     minutes = ddmm - degrees * 100
-    decimal = degrees + minutes / 60.0
-    return sign * decimal
+    return degrees + minutes / 60.0
 
-def decode_sbd_bytes(
-    data: bytes,
-    ddmm_scale: float = 1e4,
-    lat_width: int = 2,
-    lon_width: int = 2,
-    decimals: int = 6
-) -> Dict[str, Any]:
-    """
-    Decode an SBD payload produced by build_sbdwb_frame_v2, converting lat/lon from DDMM.mmmm to decimal degrees.
 
-    Parameters:
-      data: raw bytes of the SBD message payload
-      ddmm_scale: scale factor to get DDMM.mmmm from int32 (default 1e4, i.e., 4 decimals in minutes)
-      lat_width/lon_width: digits before '.' (zero-padded); default 2
-      decimals: digits after '.'; default 6
+def decimal_to_dm(decimal_deg, is_lat):
+    """Format decimal degrees as DD°MM.MMMMM'N/S or DDD°MM.MMMMM'E/W."""
+    if is_lat:
+        direction = 'N' if decimal_deg >= 0 else 'S'
+    else:
+        direction = 'E' if decimal_deg >= 0 else 'W'
+    d = abs(decimal_deg)
+    deg  = int(d)
+    mins = (d - deg) * 60.0
+    if is_lat:
+        return f"{deg:02d}°{mins:08.5f}'{direction}"
+    else:
+        return f"{deg:03d}°{mins:08.5f}'{direction}"
+
+
+# ── GNSS record parser ────────────────────────────────────────────────────────
+def parse_gnss_record(data, offset, with_timestamp):
     """
-    result: Dict[str, Any] = {
-        "raw_len": len(data),
-        "header": {},
-        "current": {},
-        "battery": {},
-        "iri_timer": {},
-        "payload_present": False,
-        "tlv": {},
-        "gnss_history": [],
-        "recording_period": {},
-        "unknown_tail": b"",
-        "errors": []
-    }
+    Parse one GNSS record (8 bytes without timestamp, 12 with).
+    Returns (GNSSReading, new_offset).
+    """
+    need = 12 if with_timestamp else 8
+    if offset + need > len(data):
+        raise ValueError(
+            f"Corrupt SBD: need {need} bytes at offset {offset}, "
+            f"only {len(data)-offset} available"
+        )
+
+    # Read as unsigned big-endian 32-bit then convert to signed decimal
+    raw_lat = struct.unpack(">I", data[offset    :offset + 4])[0]
+    raw_lon = struct.unpack(">I", data[offset + 4:offset + 8])[0]
+    lat_deg = encoded_to_decimal(raw_lat)
+    lon_deg = encoded_to_decimal(raw_lon)
+
+    timestamp, ts_utc, ts_local = None, "", ""
+    if with_timestamp:
+        raw_ts    = struct.unpack(">I", data[offset + 8:offset + 12])[0]
+        timestamp = raw_ts
+        try:
+            dt_utc   = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            dt_local = datetime.fromtimestamp(timestamp)
+            ts_utc   = dt_utc  .strftime('%Y-%m-%d %H:%M:%S UTC')
+            ts_local = dt_local.strftime('%Y-%m-%d %H:%M:%S (local)')
+        except (OSError, OverflowError, ValueError):
+            ts_utc   = f"<invalid unix ts {timestamp}>"
+            ts_local = ts_utc
+
+    return GNSSReading(
+        latitude        = lat_deg,
+        longitude       = lon_deg,
+        lat_dm          = decimal_to_dm(lat_deg, is_lat=True),
+        lon_dm          = decimal_to_dm(lon_deg, is_lat=False),
+        timestamp       = timestamp,
+        timestamp_utc   = ts_utc,
+        timestamp_local = ts_local,
+    ), offset + need
+
+
+# ── Historical-GNSS TLV length decoder ───────────────────────────────────────
+def read_hist_tlv_length(data, idx):
+    """
+    The encoder writes the byte-length of the historical block as:
+        if msg_length >= 255:
+            frame1[idx++] = 255;
+            frame1[idx++] = (uint8_t)(msg_length - 255);
+        else:
+            frame1[idx++] = (uint8_t)msg_length;
+
+    Returns (total_byte_length, new_idx).
+    """
+    if idx >= len(data):
+        raise ValueError("Unexpected end of frame reading historical TLV length")
+
+    first_byte = data[idx]; idx += 1
+
+    if first_byte == 255:
+        # two-byte encoding
+        if idx >= len(data):
+            raise ValueError("Unexpected end of frame reading historical TLV length (2nd byte)")
+        second_byte = data[idx]; idx += 1
+        total_len = 255 + second_byte
+    else:
+        total_len = first_byte
+
+    return total_len, idx
+
+
+# ── Main frame decoder ────────────────────────────────────────────────────────
+def decode_frame(data: bytes) -> dict:
+    if len(data) < 15:
+        raise ValueError(
+            f"Frame too short: {len(data)} bytes (minimum is 15)"
+        )
 
     idx = 0
-    def require(n: int) -> bool:
-        if idx + n > len(data):
-            result["errors"].append(f"Truncated: need {n} bytes at idx {idx}, only {len(data)-idx} available.")
-            return False
-        return True
 
-    if len(data) < 13:
-        result["errors"].append(f"Payload too short: {len(data)} bytes; expected at least 13.")
-        return result
+    # ── Byte 0: version + msg_type ────────────────────────────────────────────
+    byte0   = data[idx]; idx += 1
+    version  = (byte0 >> 5) & 0x07
+    msg_type =  byte0       & 0x1F
 
-    # Header
-    if not require(2): return result
-    byte0 = data[idx]; idx += 1
-    byte1 = data[idx]; idx += 1
-    version = (byte0 >> 5) & 0x07
-    msg_type = byte0 & 0x1F
-    has_payload = bool(byte1 & 0x01)
-    needs_ack = bool((byte1 >> 1) & 0x01)
-    low_power = bool((byte1 >> 2) & 0x01)
-    result["header"] = {
-        "byte0": byte0,
-        "byte1": byte1,
-        "version": version,
-        "msg_type": msg_type,
-        "has_payload": has_payload,
-        "needs_ack": needs_ack,
-        "low_power": low_power,
-    }
-    result["payload_present"] = has_payload
+    # ── Byte 1: flags ─────────────────────────────────────────────────────────
+    byte1      = data[idx]; idx += 1
+    has_payload = (byte1 & 0x01) != 0
+    needs_ack   = (byte1 & 0x02) != 0
+    low_power   = (byte1 & 0x04) != 0
 
-    # Current coordinates: lat[0], lon[0] big-endian signed int32 -> DDMM.mmmm -> decimal degrees
-    if not require(8): return result
-    lat0_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-    lon0_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-    lat0_deg = _ddmm_to_decimal_from_enc(lat0_enc, ddmm_scale)
-    lon0_deg = _ddmm_to_decimal_from_enc(lon0_enc, ddmm_scale)
-    result["current"] = {
-        "lat_enc": lat0_enc,
-        "lon_enc": lon0_enc,
-        "lat_deg": lat0_deg,
-        "lon_deg": lon0_deg,
-        "lat_deg_fmt": _format_deg(lat0_deg, width=lat_width, decimals=decimals),
-        "lon_deg_fmt": _format_deg(lon0_deg, width=lon_width, decimals=decimals),
-    }
+    # ── Latest GNSS fix (no timestamp) ───────────────────────────────────────
+    main_gnss, idx = parse_gnss_record(data, idx, with_timestamp=False)
 
-    # Battery
-    if not require(1): return result
+    # ── Battery code (1 byte) ─────────────────────────────────────────────────
     bat_code = data[idx]; idx += 1
-    result["battery"] = {"code": bat_code}
 
-    # Iridium timer
-    if not require(2): return result
-    iri_timer = int.from_bytes(data[idx:idx+2], byteorder="big", signed=False); idx += 2
-    result["iri_timer"] = {"value": iri_timer}
+    # ── Iridium timer (2 bytes, big-endian) ───────────────────────────────────
+    iri_timer = (data[idx] << 8) | data[idx + 1]; idx += 2
 
-    # Optional payload
+    # ── Optional payload TLVs ─────────────────────────────────────────────────
+    beacon_bits = None
+    historical  = []
+    tlv_log     = []          # list of dicts for display/debug
+
     if has_payload:
-        if not require(2): return result
-        tlv_type = data[idx]; idx += 1
-        tlv_len = data[idx]; idx += 1
-        if not require(tlv_len): return result
-        tlv_value = data[idx:idx+tlv_len]; idx += tlv_len
-        result["tlv"] = {
-            "type": tlv_type,
-            "length": tlv_len,
-            "value_bytes_hex": tlv_value.hex(),
-            "value_bits_msb_first": _bytes_to_bits_msb_first(tlv_value)
-        }
+        while idx < len(data):
 
-        rem = len(data) - idx
-        if rem < 2:
-            result["errors"].append("Payload present but missing final recording period (2 bytes).")
-            result["unknown_tail"] = data[idx:]
-            return result
-
-        tail_for_history = rem - 2
-        # Each GNSS history entry is now 12 bytes: lat(4) + lon(4) + timestamp(4)
-        history_entries = tail_for_history // 12
-        leftover = tail_for_history % 12
-
-        gnss_history: List[Dict[str, Any]] = []
-        for _ in range(history_entries):
-            if not require(12):
-                result["errors"].append("Truncated inside GNSS history.")
+            # need at least 1 byte for the TLV type tag
+            if idx >= len(data):
                 break
-            lat_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-            lon_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-            timestamp_enc = int.from_bytes(data[idx:idx+4], byteorder="big", signed=True); idx += 4
-            lat_deg = _ddmm_to_decimal_from_enc(lat_enc, ddmm_scale)
-            lon_deg = _ddmm_to_decimal_from_enc(lon_enc, ddmm_scale)
-            gnss_history.append({
-                "lat_enc": lat_enc,
-                "lon_enc": lon_enc,
-                "timestamp_enc": timestamp_enc,
-                "lat_deg": lat_deg,
-                "lon_deg": lon_deg,
-                "lat_deg_fmt": _format_deg(lat_deg, width=lat_width, decimals=decimals),
-                "lon_deg_fmt": _format_deg(lon_deg, width=lon_width, decimals=decimals),
-            })
-        result["gnss_history"] = gnss_history
+            tlv_type = data[idx]; idx += 1
 
-        if not require(2): return result
-        hour = data[idx]; idx += 1
-        minute = data[idx]; idx += 1
-        result["recording_period"] = {"hour": hour, "minute": minute}
+            # ── Beacon Bit Array TLV ──────────────────────────────────────────
+            if tlv_type == TLV_TYPE_BEACON_BIT_ARRAY:
+                # Standard single-byte length
+                if idx >= len(data):
+                    break
+                tlv_len = data[idx]; idx += 1
 
-        if leftover != 0:
-            start_leftover = len(data) - (2 + leftover)
-            end_leftover = len(data) - 2
-            result["unknown_tail"] = data[start_leftover:end_leftover]
-            result["errors"].append(f"Non-multiple-of-12 bytes in history section: {leftover} leftover bytes.")
-        else:
-            result["unknown_tail"] = b""
-    else:
-        if idx < len(data):
-            result["unknown_tail"] = data[idx:]
-            if len(result["unknown_tail"]) > 0:
-                result["errors"].append(f"No payload bit set, but {len(result['unknown_tail'])} extra bytes present.")
+                if idx + tlv_len > len(data):
+                    raise ValueError(
+                        f"Beacon TLV length {tlv_len} exceeds remaining frame at offset {idx}"
+                    )
+                beacon_bits = data[idx:idx + tlv_len]
+                idx += tlv_len
+                tlv_log.append({
+                    "type": tlv_type,
+                    "length_bytes": tlv_len,
+                    "label": "BEACON_BIT_ARRAY",
+                })
 
-    return result
+            # ── Historical GNSS TLV ───────────────────────────────────────────
+            elif tlv_type == TLV_TYPE_HISTORICAL_GNSS:
+                # Encoder uses a non-standard 1-or-2-byte length field
+                byte_len, idx = read_hist_tlv_length(data, idx)
 
-def pretty_print_decoded(decoded: Dict[str, Any]) -> str:
-    lines: List[str] = []
-    lines.append(f"Raw length: {decoded.get('raw_len')}")
-    h = decoded.get("header", {})
-    lines.append(f"Header byte0=0x{{h.get('byte0',0):02X}} byte1=0x{{h.get('byte1',0):02X}}")
-    lines.append(f"  version={{h.get('version')}} msg_type={{h.get('msg_type')}}")
-    lines.append(f"  has_payload={{h.get('has_payload')}} needs_ack={{h.get('needs_ack')}} low_power={{h.get('low_power')}}")
+                if byte_len % 12 != 0:
+                    raise ValueError(
+                        f"Historical GNSS TLV byte-length {byte_len} is not a "
+                        f"multiple of 12 (each record is 12 bytes)"
+                    )
+                n_readings = byte_len // 12
+                tlv_log.append({
+                    "type": tlv_type,
+                    "length_bytes": byte_len,
+                    "n_readings": n_readings,
+                    "label": "HISTORICAL_GNSS",
+                })
 
-    cur = decoded.get("current", {})
-    lines.append(f"Current coords: lat={{cur.get('lat_deg_fmt')}} lon={{cur.get('lon_deg_fmt')}} "
-                 f"(lat_enc={{cur.get('lat_enc')}} lon_enc={{cur.get('lon_enc')}})")
+                for _ in range(n_readings):
+                    if idx + 12 > len(data):
+                        print(
+                            "WARNING: frame truncated inside historical GNSS block",
+                            file=sys.stderr
+                        )
+                        break
+                    reading, idx = parse_gnss_record(data, idx, with_timestamp=True)
+                    historical.append(reading)
 
-    bat = decoded.get("battery", {})
-    lines.append(f"Battery code: {{bat.get('code')}}")
+            # ── Unknown / future TLV  (single-byte length, skip payload) ─────
+            else:
+                if idx >= len(data):
+                    break
+                tlv_len = data[idx]; idx += 1
+                tlv_log.append({
+                    "type": tlv_type,
+                    "length_bytes": tlv_len,
+                    "label": f"UNKNOWN(0x{tlv_type:02X})",
+                })
+                print(
+                    f"WARNING: unknown TLV type 0x{tlv_type:02X}, "
+                    f"skipping {tlv_len} bytes",
+                    file=sys.stderr
+                )
+                idx += tlv_len
 
-    iri = decoded.get("iri_timer", {})
-    lines.append(f"Iridium timer: {{iri.get('value')}}")
+    return {
+        "byte0":       byte0,
+        "version":     version,
+        "msg_type":    msg_type,
+        "has_payload": has_payload,
+        "needs_ack":   needs_ack,
+        "low_power":   low_power,
+        "main_gnss":   main_gnss,
+        "bat_code":    bat_code,
+        "iri_timer":   iri_timer,
+        "beacon_bits": beacon_bits,
+        "historical":  historical if historical else None,
+        "tlv_log":     tlv_log,
+    }
 
-    if decoded.get("payload_present"):
-        tlv = decoded.get("tlv", {})
-        lines.append(f"TLV: type={{tlv.get('type')}} len={{tlv.get('length')}}")
-        lines.append(f"  value(hex)={{tlv.get('value_bytes_hex')}}")
 
-        hist = decoded.get("gnss_history", [])
-        lines.append(f"GNSS history entries: {{len(hist)}} (latest-first)")
-        for i, p in enumerate(hist):
-            lines.append(f"  [{i}] lat={{p.get('lat_deg_fmt')}} lon={{p.get('lon_deg_fmt')}} "
-                         f"timestamp={{p.get('timestamp_enc')}} "
-                         f"(lat_enc={{p.get('lat_enc')}} lon_enc={{p.get('lon_enc')}})")
+# ── Pretty printer ────────────────────────────────────────────────────────────
+def print_frame(frame: dict, filename: str = None):
+    sep = "=" * 62
+    print(sep)
+    title = "Decoded SBD V2 Frame"
+    if filename:
+        title += f"  ←  {filename}"
+    print(title)
+    print(sep)
 
-        rp = decoded.get("recording_period", {})
-        lines.append(f"Recording period: hour={{rp.get('hour')}} minute={{rp.get('minute')}}")
+    print("[HEADER]")
+    print(f"  byte0       : 0x{frame['byte0']:02X}")
+    print(f"  Version     : {frame['version']}")
+    print(f"  Msg type    : {frame['msg_type']}")
+    print(f"  Has payload : {frame['has_payload']}")
+    print(f"  Needs ACK   : {frame['needs_ack']}")
+    print(f"  Low power   : {frame['low_power']}")
 
-    tail = decoded.get("unknown_tail", b"")
-    if tail:
-        lines.append(f"Unknown tail bytes ({len(tail)}): {{tail.hex()}}")
+    g = frame['main_gnss']
+    print("\n[LATEST GNSS FIX]")
+    print(f"  Latitude    : {g.latitude:.7f}  ({g.lat_dm})")
+    print(f"  Longitude   : {g.longitude:.7f}  ({g.lon_dm})")
+    print(f"  Google Maps : https://maps.google.com/?q={g.latitude},{g.longitude}")
 
-    errs = decoded.get("errors", [])
-    if errs:
-        lines.append("Errors/Notes:")
-        for e in errs:
-            lines.append(f"  - {{e}}")
+    print("\n[STATUS]")
+    print(f"  Battery code: {frame['bat_code']}  (0x{frame['bat_code']:02X})")
+    print(f"  IRI timer   : {frame['iri_timer']} sec")
 
-    return "\n".join(lines)
+    if frame['has_payload']:
+        print("\n[PAYLOAD TLVs]")
+        for i, t in enumerate(frame['tlv_log']):
+            print(f"  TLV #{i+1}: type=0x{t['type']:02X}  label={t['label']}  "
+                  f"length={t['length_bytes']} bytes"
+                  + (f"  readings={t['n_readings']}" if 'n_readings' in t else ""))
 
-def _decode_file(path: str, ddmm_scale: float = 1e4) -> Dict[str, Any]:
-    with open(path, "rb") as f:
-        data = f.read()
-    return decode_sbd_bytes(data, ddmm_scale=ddmm_scale, lat_width=2, lon_width=2, decimals=6)
+        if frame['beacon_bits'] is not None:
+            bb = frame['beacon_bits']
+            print(f"\n  Beacon Bit Array ({len(bb)} bytes): {bb.hex()}")
+            bits = ''.join(f'{b:08b}' for b in bb)
+            print(f"  Binary: {bits}")
 
+        if frame['historical']:
+            hist = frame['historical']
+            print(f"\n  Historical GNSS readings: {len(hist)}")
+            for i, r in enumerate(hist):
+                print(f"\n   #{i+1}")
+                print(f"      Latitude    : {r.latitude:.7f}  ({r.lat_dm})")
+                print(f"      Longitude   : {r.longitude:.7f}  ({r.lon_dm})")
+                print(f"      Timestamp   : {r.timestamp}")
+                print(f"      UTC         : {r.timestamp_utc}")
+                print(f"      Local       : {r.timestamp_local}")
+                print(f"      Google Maps : https://maps.google.com/?q={r.latitude},{r.longitude}")
+
+    print(sep)
+
+
+# ── Hex dump helper ───────────────────────────────────────────────────────────
+def hex_dump(data: bytes):
+    print(f"Raw hex ({len(data)} bytes):")
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_part  = ' '.join(f'{b:02X}' for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        print(f"  {i:04X}:  {hex_part:<47}  {ascii_part}")
+    print()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    # Try Colab file picker if available and no CLI args
-    import sys
+    parser = argparse.ArgumentParser(
+        description="Decode SBD frames built by build_sbdwb_frame_v2()",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--file",    "-f", required=True, help="Binary SBD frame file")
+    parser.add_argument("--raw-hex", action="store_true",  help="Print hex dump before decoding")
+    parser.add_argument("--json",    action="store_true",  help="Output as JSON")
+    args = parser.parse_args()
+
     try:
-        if len(sys.argv) == 1:
-            import google.colab  # type: ignore
-            from google.colab import files  # type: ignore
-            print("Select your SBD payload file...")
-            uploaded = files.upload()
-            for fname in uploaded.keys():
-                input_bytes = uploaded[fname]
-                print(f"Decoding: {{fname}}")
-                decoded = decode_sbd_bytes(input_bytes, ddmm_scale=1e4, lat_width=2, lon_width=2, decimals=6)
-                print(pretty_print_decoded(decoded))
-            return
-    except Exception:
-        pass
+        with open(args.file, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        print(f"ERROR opening file: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # Simple CLI for terminal use
-    p = argparse.ArgumentParser(description="Decode Iridium SBD payloads (DDMM.mmmm -> decimal degrees).")
-    p.add_argument("--file", "-f", help="Path to a binary SBD payload file.")
-    p.add_argument("--hex", "-x", help="Hex string representing the payload bytes.")
-    p.add_argument("--ddmm-scale", type=float, default=1e4, help="Scale of encoded DDMM.mmmm (default 1e4).")
-    args = p.parse_args()
+    if args.raw_hex:
+        hex_dump(data)
 
-    if args.file:
-        decoded = _decode_file(args.file, ddmm_scale=args.ddmm_scale)
-        print(pretty_print_decoded(decoded))
-    elif args.hex:
-        payload = bytes.fromhex(args.hex.strip())
-        decoded = decode_sbd_bytes(payload, ddmm_scale=args.ddmm_scale, lat_width=2, lon_width=2, decimals=6)
-        print(pretty_print_decoded(decoded))
+    try:
+        frame = decode_frame(data)
+    except ValueError as e:
+        print(f"DECODE ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        import json
+        def _default(obj):
+            if isinstance(obj, GNSSReading): return asdict(obj)
+            if isinstance(obj, bytes):       return obj.hex()
+            raise TypeError(f"Not serialisable: {type(obj)}")
+        print(json.dumps(frame, indent=2, default=_default))
     else:
-        p.print_help()
+        print_frame(frame, filename=args.file)
+
 
 if __name__ == "__main__":
     main()
